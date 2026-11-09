@@ -6,7 +6,11 @@
 #      anexa o APK na MESMA Release.
 #
 # O repositorio so precisa deste arquivo em .github/workflows/build.yml (branch main).
-# Tambem da pra rodar na mao: Actions > Build APK from Release > Run workflow > tag.
+# Tambem da pra rodar na mao: Actions > Build APK from Release > Run workflow.
+#
+# Velocidade: por padrao compila so arm64-v8a (todo celular moderno). Para outras
+# ABIs rode na mao e preencha "abis" (ex: arm64-v8a,armeabi-v7a,x86_64) ou mude
+# o valor padrao de ABIS aqui embaixo.
 
 name: Build APK from Release
 
@@ -19,9 +23,14 @@ on:
         description: "Tag da Release que contem o .zip (ex: v1.0)"
         required: true
         type: string
+      abis:
+        description: "ABIs separadas por virgula (padrao: arm64-v8a)"
+        required: false
+        default: "arm64-v8a"
+        type: string
 
 permissions:
-  contents: write   # necessario para anexar o APK na Release
+  contents: write   # anexar o APK na Release
 
 concurrency:
   group: build-${{ github.event.release.tag_name || inputs.tag }}
@@ -29,26 +38,28 @@ concurrency:
 
 env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  ABIS: ${{ inputs.abis || 'arm64-v8a' }}
   GH_REPO: ${{ github.repository }}
   GH_TOKEN: ${{ github.token }}
   NDK_VERSION: "28.2.13676358"   # tem que bater com ndkVersion do app/build.gradle.kts
   CMAKE_VERSION: "3.22.1"        # idem (externalNativeBuild.cmake.version)
+  SDL_MIXER_VERSION: "2.8.1"     # o .zip traz a pasta SDL2_mixer vazia (submodulo faltando)
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       # ------------------------------------------------------------------
-      # 1) Pega o .zip anexado na Release
+      # 1) .zip da Release -> projeto pronto pra compilar
       # ------------------------------------------------------------------
       - name: Baixar o .zip da Release
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dl
-          echo "Release: $TAG"
+          echo "Release: $TAG | ABIs: $ABIS"
 
           # Se a Release foi publicada antes do upload do .zip terminar, espera um pouco.
           found=0
@@ -61,27 +72,25 @@ jobs:
             echo "Nenhum .zip na Release ainda ($i/18), aguardando 10s..."
             sleep 10
           done
-
           if [ "$found" -ne 1 ]; then
-            echo "::error::Nenhum arquivo .zip encontrado nos assets da Release '$TAG'. Anexe o .zip do projeto e rode de novo (Actions > Run workflow)."
+            echo "::error::Nenhum .zip nos assets da Release '$TAG'. Anexe o .zip do projeto e rode de novo (Actions > Run workflow)."
             exit 1
           fi
 
           # Se tiver mais de um .zip, usa o maior (o do projeto).
           ZIP="$(ls -S dl/*.zip | head -n1)"
           echo "Usando: $ZIP"
-          ls -lh dl/*.zip
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
 
-      - name: Extrair e localizar o projeto
+      - name: Extrair e preparar o projeto
+        id: prep
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src
           unzip -q "$ZIP" -d src
 
-          # O projeto Gradle fica em <raiz>/app (tem gradlew). Funciona com zip
-          # que tem pasta-raiz ou com arquivos soltos.
+          # O projeto Gradle fica em <raiz>/app (tem gradlew).
           GRADLEW="$(find src -maxdepth 4 -type f -name gradlew -path '*/app/gradlew' | head -n1)"
           if [ -z "$GRADLEW" ]; then
             echo "::error::Nao achei app/gradlew dentro do .zip. Estrutura esperada: <raiz>/app/gradlew"
@@ -90,18 +99,57 @@ jobs:
           APP_DIR="$(realpath "$(dirname "$GRADLEW")")"
           ROOT_DIR="$(dirname "$APP_DIR")"
           chmod +x "$APP_DIR/gradlew"
-
-          # O SDL2 empacotado traz um gradle-wrapper.jar proprio (android-project/)
-          # que nao e usado no build e reprova na validacao do setup-gradle.
-          # Apaga so os que NAO sao do app/, mantendo a validacao do wrapper real.
-          find "$ROOT_DIR" -type f -name gradle-wrapper.jar -not -path "$APP_DIR/*" -print -delete
-
           echo "APP_DIR=$APP_DIR"   >> "$GITHUB_ENV"
           echo "ROOT_DIR=$ROOT_DIR" >> "$GITHUB_ENV"
-          echo "Raiz do projeto: $ROOT_DIR"
+
+          # O SDL2 empacotado traz um gradle-wrapper.jar proprio que nao e usado
+          # e reprova na validacao do setup-gradle. Apaga so os de fora do app/.
+          find "$ROOT_DIR" -type f -name gradle-wrapper.jar -not -path "$APP_DIR/*" -delete
+
+          # SDL2_mixer vem VAZIO no .zip (submodulo git nao incluido): baixa a fonte.
+          MIX="$ROOT_DIR/sonic-r-main/source/android/SDL2_mixer"
+          if [ ! -f "$MIX/CMakeLists.txt" ]; then
+            echo "SDL2_mixer vazio no .zip -> baixando release-$SDL_MIXER_VERSION"
+            mkdir -p "$MIX"
+            curl -fsSL --retry 3 \
+              "https://github.com/libsdl-org/SDL_mixer/archive/refs/tags/release-${SDL_MIXER_VERSION}.tar.gz" \
+              | tar -xz -C "$MIX" --strip-components=1
+          fi
+          test -f "$MIX/CMakeLists.txt" && test -f "$MIX/include/SDL_mixer.h" \
+            || { echo "::error::SDL2_mixer incompleto"; exit 1; }
+
+          # Limita as ABIs (3 ABIs = 3x o tempo de compilacao nativa).
+          ABI_LIST="\"$(echo "$ABIS" | tr -d ' ' | sed 's/,/", "/g')\""
+          sed -i -E "s/\"arm64-v8a\", *\"x86_64\", *\"armeabi-v7a\"/${ABI_LIST}/g" "$APP_DIR/build.gradle.kts"
+          grep -n 'arm64-v8a' "$APP_DIR/build.gradle.kts" || true
+
+          # ABI do Android -> triple do Rust
+          TRIPLES=""
+          for a in ${ABIS//,/ }; do
+            case "$a" in
+              arm64-v8a)   t=aarch64-linux-android ;;
+              armeabi-v7a) t=armv7-linux-androideabi ;;
+              x86_64)      t=x86_64-linux-android ;;
+              x86)         t=i686-linux-android ;;
+              *) echo "::error::ABI desconhecida: $a"; exit 1 ;;
+            esac
+            TRIPLES="${TRIPLES:+$TRIPLES,}$t"
+          done
+          echo "triples=$TRIPLES" >> "$GITHUB_OUTPUT"
+
+          # Pula o lint do release (nao muda o APK, so gasta tempo).
+          {
+            echo 'allprojects {'
+            echo '    tasks.configureEach {'
+            echo '        if (name.startsWith("lintVital") || name.startsWith("lintAnalyze")) {'
+            echo '            enabled = false'
+            echo '        }'
+            echo '    }'
+            echo '}'
+          } > "$RUNNER_TEMP/skip-lint.init.gradle"
 
       # ------------------------------------------------------------------
-      # 2) Toolchains
+      # 2) Toolchains (usa o que ja vem na imagem do runner quando possivel)
       # ------------------------------------------------------------------
       - name: JDK 21
         uses: actions/setup-java@v4
@@ -109,111 +157,144 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Android SDK + NDK + CMake
-        uses: android-actions/setup-android@v3
-        with:
-          packages: >-
-            platform-tools
-            platforms;android-34
-            build-tools;35.0.0
-            ndk;${{ env.NDK_VERSION }}
-            cmake;${{ env.CMAKE_VERSION }}
+      - name: NDK + CMake (so instala se faltar)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          need=()
+          [ -d "$SDK/ndk/$NDK_VERSION" ]     || need+=("ndk;$NDK_VERSION")
+          [ -d "$SDK/cmake/$CMAKE_VERSION" ] || need+=("cmake;$CMAKE_VERSION")
+          if [ "${#need[@]}" -gt 0 ]; then
+            echo "Instalando: ${need[*]}"
+            SM="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n1)"
+            yes | "$SM" --licenses > /dev/null || true
+            "$SM" --install "${need[@]}" > /dev/null
+          else
+            echo "NDK $NDK_VERSION e CMake $CMAKE_VERSION ja estao na imagem."
+          fi
+          command -v ccache > /dev/null || sudo apt-get install -y --no-install-recommends ccache > /dev/null
 
-      - name: Rust (para o sidecar de netplay)
+      - name: Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,x86_64-linux-android,armv7-linux-androideabi
+          targets: ${{ steps.prep.outputs.triples }}
 
-      - name: Cache do Cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Restaurar cache (ccache + Cargo)
+        uses: actions/cache/restore@v4
         with:
-          workspaces: ${{ env.ROOT_DIR }}/sidecar
+          path: |
+            ~/.ccache
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+            ${{ env.ROOT_DIR }}/sidecar/target
+          key: build-${{ runner.os }}-${{ env.ABIS }}-${{ github.run_id }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ env.ABIS }}-
 
-      - name: Instalar cargo-ndk
-        run: cargo install cargo-ndk --locked
+      - name: cargo-ndk (so instala se nao veio do cache)
+        run: command -v cargo-ndk > /dev/null || cargo install cargo-ndk --locked
+
+      - name: Setup Gradle (cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: ${{ env.APP_DIR }}
 
       # ------------------------------------------------------------------
-      # 3) libsonicr_netplay.so (Rust)
-      #    O GameActivity carrega essa lib no boot (getLibraries). Nada no
-      #    Gradle compila ela, entao se ela nao entrar no APK o jogo fecha
-      #    ao abrir. Compilamos aqui e colocamos em app/src/main/jniLibs.
+      # 3) Compilar: C/C++ (SDL2 + engine) e Rust (netplay) EM PARALELO.
+      #    O GameActivity carrega libsonicr_netplay.so ao abrir; nada no Gradle
+      #    compila ela, entao ela e gerada aqui e entra em app/src/main/jniLibs.
+      #    O build "release" ja assina com a chave debug (sem secrets).
       # ------------------------------------------------------------------
-      - name: Compilar sidecar Rust (arm64-v8a, x86_64, armeabi-v7a)
+      - name: Compilar APK
         shell: bash
         run: |
           set -euo pipefail
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
           JNI_DIR="$APP_DIR/src/main/jniLibs"
 
-          if [ -f "$JNI_DIR/arm64-v8a/libsonicr_netplay.so" ]; then
-            echo "libsonicr_netplay.so ja veio no .zip, pulando a compilacao do Rust."
-            exit 0
-          fi
-          if [ ! -f "$ROOT_DIR/sidecar/Cargo.toml" ]; then
-            echo "::error::sidecar/Cargo.toml nao existe no .zip e a lib de netplay nao esta em jniLibs. O jogo nao abriria."
-            exit 1
+          # ccache nas compilacoes C do CMake
+          export CCACHE_DIR="$HOME/.ccache" CCACHE_MAXSIZE=400M CCACHE_COMPRESS=1
+          export CCACHE_BASEDIR="$GITHUB_WORKSPACE" CCACHE_NOHASHDIR=1
+          export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ccache -z > /dev/null
+
+          # --- Rust em segundo plano ---
+          RUST_LOG_FILE="$RUNNER_TEMP/rust.log"
+          RUST_PID=""
+          trap 'echo "::group::Log do Rust"; cat "$RUST_LOG_FILE" 2>/dev/null || true; echo "::endgroup::"' EXIT
+
+          missing=0
+          for a in ${ABIS//,/ }; do
+            [ -f "$JNI_DIR/$a/libsonicr_netplay.so" ] || missing=1
+          done
+          if [ "$missing" -eq 1 ]; then
+            [ -f "$ROOT_DIR/sidecar/Cargo.toml" ] || {
+              echo "::error::sidecar/Cargo.toml nao existe e a lib de netplay nao esta em jniLibs. O jogo nao abriria."
+              exit 1
+            }
+            RT=(); for a in ${ABIS//,/ }; do RT+=(-t "$a"); done
+            ( cd "$ROOT_DIR/sidecar" && cargo ndk "${RT[@]}" -o "$JNI_DIR" build --release ) \
+              > "$RUST_LOG_FILE" 2>&1 &
+            RUST_PID=$!
+          else
+            echo "libsonicr_netplay.so ja veio no .zip, pulando o Rust."
           fi
 
-          cd "$ROOT_DIR/sidecar"
-          cargo ndk \
-            -t arm64-v8a -t x86_64 -t armeabi-v7a \
-            -o "$JNI_DIR" \
-            build --release
-          find "$JNI_DIR" -name '*.so' -exec ls -lh {} \;
+          # --- C/C++ (CMake via Gradle) ---
+          cd "$APP_DIR"
+          GRADLE=(./gradlew -I "$RUNNER_TEMP/skip-lint.init.gradle"
+                  --build-cache --parallel --warning-mode summary
+                  -Dorg.gradle.jvmargs=-Xmx3g)
 
-      # ------------------------------------------------------------------
-      # 4) APK (SDL2 + engine via CMake/NDK, tudo pelo Gradle)
-      #    O build "release" ja usa a chave debug no build.gradle.kts, entao o
-      #    APK sai assinado e instalavel sem nenhum secret.
-      # ------------------------------------------------------------------
-      - name: Setup Gradle (cache)
-        uses: gradle/actions/setup-gradle@v4
+          "${GRADLE[@]}" externalNativeBuildRelease
+          ccache -s | head -n 8 || true
+
+          if [ -n "$RUST_PID" ]; then
+            wait "$RUST_PID"
+            find "$JNI_DIR" -name 'libsonicr_netplay.so' -exec ls -lh {} \;
+          fi
+
+          # --- Empacotar (a parte nativa ja esta pronta) ---
+          "${GRADLE[@]}" assembleRelease
+
+      - name: Salvar cache
+        if: always()
+        uses: actions/cache/save@v4
         with:
-          build-root-directory: ${{ env.APP_DIR }}
+          path: |
+            ~/.ccache
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+            ${{ env.ROOT_DIR }}/sidecar/target
+          key: build-${{ runner.os }}-${{ env.ABIS }}-${{ github.run_id }}
 
-      - name: Compilar APK (release)
-        shell: bash
-        working-directory: ${{ env.APP_DIR }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
-
+      # ------------------------------------------------------------------
+      # 4) Conferir e publicar
+      # ------------------------------------------------------------------
       - name: Conferir libs nativas dentro do APK
         shell: bash
         run: |
           set -euo pipefail
           APK="$(find "$APP_DIR/build/outputs/apk/release" -name '*.apk' | head -n1)"
           [ -n "$APK" ] || { echo "::error::APK nao foi gerado"; exit 1; }
-          echo "APK: $APK"
           LIST="$(unzip -l "$APK")"
-          for abi in arm64-v8a x86_64 armeabi-v7a; do
+          for abi in ${ABIS//,/ }; do
             for lib in libmain.so libSDL2.so libsonicr_netplay.so; do
-              if ! grep -q "lib/$abi/$lib" <<<"$LIST"; then
-                echo "::error::lib/$abi/$lib nao esta no APK"
-                exit 1
-              fi
+              grep -q "lib/$abi/$lib" <<<"$LIST" || { echo "::error::lib/$abi/$lib nao esta no APK"; exit 1; }
             done
           done
-          echo "Todas as libs nativas presentes (3 ABIs)."
+          echo "Libs nativas OK ($ABIS)."
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
-      # ------------------------------------------------------------------
-      # 5) Publica o APK na Release
-      # ------------------------------------------------------------------
-      - name: Renomear e anexar o APK na Release
+      - name: Anexar o APK na Release
         shell: bash
         run: |
           set -euo pipefail
           SAFE_TAG="${TAG//\//-}"
-          mkdir -p out
-          cp "$APK_PATH" "out/SonicR-${SAFE_TAG}.apk"
-          gh release upload "$TAG" "out/SonicR-${SAFE_TAG}.apk" --clobber
-          {
-            echo "### APK pronto"
-            echo "Anexado na Release **$TAG**: \`SonicR-${SAFE_TAG}.apk\` ($(du -h "out/SonicR-${SAFE_TAG}.apk" | cut -f1))"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Guardar tambem como artifact do workflow
-        uses: actions/upload-artifact@v4
-        with:
-          name: SonicR-apk
-          path: out/*.apk
-          if-no-files-found: error
+          OUT="SonicR-${SAFE_TAG}.apk"
+          cp "$APK_PATH" "$OUT"
+          gh release upload "$TAG" "$OUT" --clobber
+          echo "### APK pronto: \`$OUT\` ($(du -h "$OUT" | cut -f1)) | ABIs: $ABIS" >> "$GITHUB_STEP_SUMMARY"
