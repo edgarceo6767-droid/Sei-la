@@ -1,0 +1,213 @@
+# .github/workflows/build.yml
+#
+# Fluxo:
+#   1. Voce cria uma Release e anexa o .zip do projeto (sonic-r-android-vr.zip).
+#   2. Ao publicar, este workflow baixa o .zip da Release, extrai, compila e
+#      anexa o APK na MESMA Release.
+#
+# O repositorio so precisa deste arquivo em .github/workflows/build.yml (branch main).
+# Tambem da pra rodar na mao: Actions > Build APK from Release > Run workflow > tag.
+
+name: Build APK from Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag da Release que contem o .zip (ex: v1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # necessario para anexar o APK na Release
+
+concurrency:
+  group: build-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: true
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ github.token }}
+  NDK_VERSION: "28.2.13676358"   # tem que bater com ndkVersion do app/build.gradle.kts
+  CMAKE_VERSION: "3.22.1"        # idem (externalNativeBuild.cmake.version)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1) Pega o .zip anexado na Release
+      # ------------------------------------------------------------------
+      - name: Baixar o .zip da Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          echo "Release: $TAG"
+
+          # Se a Release foi publicada antes do upload do .zip terminar, espera um pouco.
+          found=0
+          for i in $(seq 1 18); do
+            if gh release download "$TAG" --pattern '*.zip' --dir dl --clobber 2>/dev/null \
+               && compgen -G "dl/*.zip" > /dev/null; then
+              found=1
+              break
+            fi
+            echo "Nenhum .zip na Release ainda ($i/18), aguardando 10s..."
+            sleep 10
+          done
+
+          if [ "$found" -ne 1 ]; then
+            echo "::error::Nenhum arquivo .zip encontrado nos assets da Release '$TAG'. Anexe o .zip do projeto e rode de novo (Actions > Run workflow)."
+            exit 1
+          fi
+
+          # Se tiver mais de um .zip, usa o maior (o do projeto).
+          ZIP="$(ls -S dl/*.zip | head -n1)"
+          echo "Usando: $ZIP"
+          ls -lh dl/*.zip
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Extrair e localizar o projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          unzip -q "$ZIP" -d src
+
+          # O projeto Gradle fica em <raiz>/app (tem gradlew). Funciona com zip
+          # que tem pasta-raiz ou com arquivos soltos.
+          GRADLEW="$(find src -maxdepth 4 -type f -name gradlew -path '*/app/gradlew' | head -n1)"
+          if [ -z "$GRADLEW" ]; then
+            echo "::error::Nao achei app/gradlew dentro do .zip. Estrutura esperada: <raiz>/app/gradlew"
+            exit 1
+          fi
+          APP_DIR="$(realpath "$(dirname "$GRADLEW")")"
+          ROOT_DIR="$(dirname "$APP_DIR")"
+          chmod +x "$APP_DIR/gradlew"
+          echo "APP_DIR=$APP_DIR"   >> "$GITHUB_ENV"
+          echo "ROOT_DIR=$ROOT_DIR" >> "$GITHUB_ENV"
+          echo "Raiz do projeto: $ROOT_DIR"
+
+      # ------------------------------------------------------------------
+      # 2) Toolchains
+      # ------------------------------------------------------------------
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Android SDK + NDK + CMake
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-34
+            build-tools;35.0.0
+            ndk;${{ env.NDK_VERSION }}
+            cmake;${{ env.CMAKE_VERSION }}
+
+      - name: Rust (para o sidecar de netplay)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android,armv7-linux-androideabi
+
+      - name: Cache do Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.ROOT_DIR }}/sidecar
+
+      - name: Instalar cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # ------------------------------------------------------------------
+      # 3) libsonicr_netplay.so (Rust)
+      #    O GameActivity carrega essa lib no boot (getLibraries). Nada no
+      #    Gradle compila ela, entao se ela nao entrar no APK o jogo fecha
+      #    ao abrir. Compilamos aqui e colocamos em app/src/main/jniLibs.
+      # ------------------------------------------------------------------
+      - name: Compilar sidecar Rust (arm64-v8a, x86_64, armeabi-v7a)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          JNI_DIR="$APP_DIR/src/main/jniLibs"
+
+          if [ -f "$JNI_DIR/arm64-v8a/libsonicr_netplay.so" ]; then
+            echo "libsonicr_netplay.so ja veio no .zip, pulando a compilacao do Rust."
+            exit 0
+          fi
+          if [ ! -f "$ROOT_DIR/sidecar/Cargo.toml" ]; then
+            echo "::error::sidecar/Cargo.toml nao existe no .zip e a lib de netplay nao esta em jniLibs. O jogo nao abriria."
+            exit 1
+          fi
+
+          cd "$ROOT_DIR/sidecar"
+          cargo ndk \
+            -t arm64-v8a -t x86_64 -t armeabi-v7a \
+            -o "$JNI_DIR" \
+            build --release
+          find "$JNI_DIR" -name '*.so' -exec ls -lh {} \;
+
+      # ------------------------------------------------------------------
+      # 4) APK (SDL2 + engine via CMake/NDK, tudo pelo Gradle)
+      #    O build "release" ja usa a chave debug no build.gradle.kts, entao o
+      #    APK sai assinado e instalavel sem nenhum secret.
+      # ------------------------------------------------------------------
+      - name: Setup Gradle (cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: ${{ env.APP_DIR }}
+
+      - name: Compilar APK (release)
+        shell: bash
+        working-directory: ${{ env.APP_DIR }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Conferir libs nativas dentro do APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$APP_DIR/build/outputs/apk/release" -name '*.apk' | head -n1)"
+          [ -n "$APK" ] || { echo "::error::APK nao foi gerado"; exit 1; }
+          echo "APK: $APK"
+          LIST="$(unzip -l "$APK")"
+          for abi in arm64-v8a x86_64 armeabi-v7a; do
+            for lib in libmain.so libSDL2.so libsonicr_netplay.so; do
+              if ! grep -q "lib/$abi/$lib" <<<"$LIST"; then
+                echo "::error::lib/$abi/$lib nao esta no APK"
+                exit 1
+              fi
+            done
+          done
+          echo "Todas as libs nativas presentes (3 ABIs)."
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 5) Publica o APK na Release
+      # ------------------------------------------------------------------
+      - name: Renomear e anexar o APK na Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          SAFE_TAG="${TAG//\//-}"
+          mkdir -p out
+          cp "$APK_PATH" "out/SonicR-${SAFE_TAG}.apk"
+          gh release upload "$TAG" "out/SonicR-${SAFE_TAG}.apk" --clobber
+          {
+            echo "### APK pronto"
+            echo "Anexado na Release **$TAG**: \`SonicR-${SAFE_TAG}.apk\` ($(du -h "out/SonicR-${SAFE_TAG}.apk" | cut -f1))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar tambem como artifact do workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: SonicR-apk
+          path: out/*.apk
+          if-no-files-found: error
