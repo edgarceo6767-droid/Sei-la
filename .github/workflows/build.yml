@@ -90,6 +90,12 @@ jobs:
           APP_DIR="$(realpath "$(dirname "$GRADLEW")")"
           ROOT_DIR="$(dirname "$APP_DIR")"
           chmod +x "$APP_DIR/gradlew"
+
+          # O SDL2 empacotado traz um gradle-wrapper.jar proprio (android-project/)
+          # que nao e usado no build e reprova na validacao do setup-gradle.
+          # Apaga so os que NAO sao do app/, mantendo a validacao do wrapper real.
+          find "$ROOT_DIR" -type f -name gradle-wrapper.jar -not -path "$APP_DIR/*" -print -delete
+
           echo "APP_DIR=$APP_DIR"   >> "$GITHUB_ENV"
           echo "ROOT_DIR=$ROOT_DIR" >> "$GITHUB_ENV"
           echo "Raiz do projeto: $ROOT_DIR"
